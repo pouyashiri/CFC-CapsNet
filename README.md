@@ -27,5 +27,5 @@ Parameters:<br />
 `--res_folder`: The output folder to print the results into<br />
 `--aug`: Whether or not use a little augmentation to the dataset (options: 0,1)<br />
 `--nc_recon`: Performing the reconstruction in a single channel or all channels (options: 1,3)<br />
-`--hard`: Perform hard-training at the end or not (hard-training: training while tightening the bounds of the margin loss, options: 0,1)
+`--hard`: Perform hard-training at the end or not (hard-training: training while tightening the bounds of the margin loss, options: 0,1)<br />
 `--checkpoint`: The file address of the checkpoint file (used for hard training)
