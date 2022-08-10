@@ -66,18 +66,107 @@ class CFCLayer(nn.Module):
 
         return torch.cat(out_fc, dim=1)
 
+"""
+Randomly drops some capsules during training (Inverse Dropout)
+Inputs:
+drp_rate (float): the drop rate
+is_training (boolean): True for training, False otherwise
+x (Tensor): (None, num_capsules, capsule_dims)  
+"""
+class CapsuleDropout(nn.Module):
+    def __init__(self, drp_rate):
+        super(CapsuleDropout, self).__init__()
+        self.drp_rate = drp_rate
+
+
+    def forward(self, x, is_training):
+        if self.drp_rate == 0 or is_training == False:
+            return x
+
+        # # during testing, the tensor is multiplied by dropout rate
+        # if is_training == False:
+        #     return x*self.drp_rate
+
+        mask = np.random.binomial(1, 1 - self.drp_rate, x.size(0) * x.size(1)).reshape((x.size(0), x.size(1)))
+        maskTensor = torch.tensor(mask)
+        maskTensor = torch.unsqueeze(maskTensor, -1)
+        maskTensor = maskTensor.float().cuda()
+        return (x * maskTensor)/(1-self.drp_rate)
+
+"""
+The decoder of CapsNet, reconstructs the input images using the capsule encoding. 
+Inputs:
+w: width and height of the final conv feature map in the encoder
+org_w: width and height of the images
+nc: number of classes
+nc_recon: number of reconstructed channels (grayscale reconstruction works better)
+type: the type of the decoder (FC, DECONV)
+NOTE: currently only supported for 32x32 and 28x28 images
+"""
+class CapsNetDecoder(nn.Module):
+    def __init__(self, org_w, nc, nc_recon, dec_type):
+        super(CapsNetDecoder, self).__init__()
+        self.dec_type = dec_type
+        self.w = 10 if org_w == 32 else 6
+        self.nc = nc
+
+        if dec_type == 'FC':
+            # updated decoder to get both output vectors
+            self.decoder = nn.Sequential(
+                nn.Linear(16 * nc, 512),
+                nn.ReLU(inplace=True),
+                nn.Linear(512, 1024),
+                nn.ReLU(inplace=True),
+                nn.Linear(1024, org_w ** 2 * nc_recon),
+                nn.Sigmoid()
+            )
+        else:
+            self.fc_end = nn.Linear(16, 8 * (self.w**2))
+            self.bn = nn.BatchNorm1d(8 * (self.w**2), momentum=0.8)
+            self.deconvs = nn.Sequential(
+                nn.ConvTranspose2d(8, 128, 3),
+                nn.ConvTranspose2d(128, 64, 5),
+                nn.ConvTranspose2d(64, 32, 5),
+                nn.ConvTranspose2d(32, 16, 5),
+                nn.ConvTranspose2d(16, 16, 5),
+                nn.ConvTranspose2d(16, 16, 3),
+                nn.ConvTranspose2d(16, nc_recon, 3))
+
+    def forward(self, x, y, classes):
+        if self.dec_type == 'FC':
+            if y is None:
+                # In all batches, get the most active capsule.
+                _, max_length_indices = classes.max(dim=1)
+                y = Variable(torch.eye(self.nc)).cuda().index_select(dim=0, index=max_length_indices.data)
+            reconstructions = self.decoder((x * y[:, :, None]).reshape(x.size(0), -1))
+        else:
+            if y is None:
+                _, max_length_indices = classes.max(dim=1)
+            else:
+                _, max_length_indices = y.max(dim=1)
+
+            reconRes = torch.Tensor(np.zeros((x.size(0), x.size(2)))).cuda()
+            for i in range(x.size(0)):
+                reconRes[i, :] = x[i, max_length_indices[i], :]
+
+            x = self.bn(self.fc_end(reconRes))
+
+            x = x.reshape(x.size(0), 8, self.w, self.w)
+
+            x = F.relu(self.deconvs(x))
+            reconstructions = x.reshape(x.size(0), -1)
+
+        return classes, reconstructions
+
+
 
 class CapsuleLayer(nn.Module):
     def __init__(self, num_capsules, in_channels, out_channels, num_classes,
                  num_iterations=3):
         super(CapsuleLayer, self).__init__()
-
         self.num_iterations = num_iterations
-
         self.num_capsules = num_capsules
-
         self.num_classes = num_classes
-
         self.route_weights = nn.Parameter(torch.randn(num_classes, num_capsules, in_channels, out_channels))
 
     def squash(self, tensor, dim=-1):
@@ -86,6 +175,7 @@ class CapsuleLayer(nn.Module):
         return scale * tensor / torch.sqrt(squared_norm)
 
     def forward(self, x):
+
         # print(f'###{x[None, :, :, None, :].size()}-{self.route_weights[:, None, :, :, :].size()}')
         priors = x[None, :, :, None, :] @ self.route_weights[:, None, :, :, :]
 
@@ -102,14 +192,10 @@ class CapsuleLayer(nn.Module):
 
 
 class CapsuleNet(nn.Module):
-    def __init__(self, num_class, niter, width, in_channels=1, fc_kernel_size=1, fc_out_dim=8, nc_recon=1,
+    def __init__(self, num_class, niter, width, in_channels=1, fc_kernel_size=1, fc_out_dim=8, drp=0, nc_recon=1,
                  decoder_type='FC'):
         super(CapsuleNet, self).__init__()
 
-        self.nc_recon = nc_recon
-        self.decoder_type = decoder_type
-
-        self.nc = num_class
         self.conv0 = nn.Conv2d(in_channels=in_channels, out_channels=256, kernel_size=9, stride=1)
         self.conv1 = nn.Conv2d(in_channels=256, out_channels=256, kernel_size=9, stride=2)
         self.width = width
@@ -125,42 +211,9 @@ class CapsuleNet(nn.Module):
                                   num_classes=num_class,
                                   num_iterations=niter)
 
+        self.dropout = CapsuleDropout(drp)
       
-        if decoder_type == 'FC':
-            # updated decoder to get both output vectors
-            self.decoder = nn.Sequential(
-                nn.Linear(16 * num_class, 512),
-                nn.ReLU(inplace=True),
-                nn.Linear(512, 1024),
-                nn.ReLU(inplace=True),
-                nn.Linear(1024, width ** 2 * in_channels),
-                nn.Sigmoid()
-            )
-        else:
-            if width == 32:
-                self.fc_end = nn.Linear(16, 8 * 10 * 10)
-                self.bn = nn.BatchNorm1d(800, momentum=0.8)
-                self.deconvs = nn.Sequential(
-                    nn.ConvTranspose2d(8, 128, 3),
-                    nn.ConvTranspose2d(128, 64, 5),
-                    nn.ConvTranspose2d(64, 32, 5),
-                    nn.ConvTranspose2d(32, 16, 5),
-                    nn.ConvTranspose2d(16, 16, 5),
-                    nn.ConvTranspose2d(16, 16, 3),
-                    nn.ConvTranspose2d(16, self.nc_recon, 3),
-                )
-            elif width == 28:
-                self.fc_end = nn.Linear(16, 8 * 6 * 6)
-                self.bn = nn.BatchNorm1d(288, momentum=0.8)
-                self.deconvs = nn.Sequential(
-                    nn.ConvTranspose2d(8, 128, 3),
-                    nn.ConvTranspose2d(128, 64, 5),
-                    nn.ConvTranspose2d(64, 32, 5),
-                    nn.ConvTranspose2d(32, 16, 5),
-                    nn.ConvTranspose2d(16, 16, 5),
-                    nn.ConvTranspose2d(16, 16, 3),
-                    nn.ConvTranspose2d(16, 1, 3),
-                )
+        self.decoder = CapsNetDecoder(width, num_class, nc_recon, decoder_type)
 
 
 
@@ -176,7 +229,11 @@ class CapsuleNet(nn.Module):
 
         x = self.cfc1(x)
 
+
         x = self.squash(x, dim=-1)
+
+        x = self.dropout(x, not(y is None))
+
 
 
         res = self.caps1(x.view(x.size(0), -1, self.fc_out_dim)).squeeze().transpose(0, 1)
@@ -185,33 +242,7 @@ class CapsuleNet(nn.Module):
 
         classes = F.softmax(classes, dim=-1)
 
-        if self.decoder_type == 'FC':
-            if y is None:
-                # In all batches, get the most active capsule.
-                _, max_length_indices = classes.max(dim=1)
-                y = Variable(torch.eye(self.nc)).cuda().index_select(dim=0, index=max_length_indices.data)
-            reconstructions = self.decoder((res * y[:, :, None]).reshape(res.size(0), -1))
-        else:
-            if y is None:
-                _, max_length_indices = classes.max(dim=1)
-            else:
-                _, max_length_indices = y.max(dim=1)
-
-            reconRes = torch.Tensor(np.zeros((res.size(0), res.size(2)))).cuda()
-            for i in range(res.size(0)):
-                reconRes[i, :] = res[i, max_length_indices[i], :]
-
-            # print(f'!@#!@# reconres size = {reconRes.size()}')
-            x = self.bn(self.fc_end(reconRes))
-
-            if self.width == 32:
-                x = x.reshape(x.size(0), 8, 10, 10)
-            elif self.width == 28:
-                x = x.reshape(x.size(0), 8, 6, 6)
-
-            x = F.relu(self.deconvs(x))
-            reconstructions = x.reshape(x.size(0), -1)
-
+        classes, reconstructions = self.decoder(res, y, classes)
 
         return classes, reconstructions
 
@@ -266,6 +297,7 @@ if __name__ == "__main__":
     parser.add_argument('--dset', default='mnist', required=True)
     parser.add_argument('--nc', default=10, type=int, required=True)
     parser.add_argument('--w', default=28, type=int, required=True)
+    parser.add_argument('--dpath', default='')
     parser.add_argument('--bsize', default=128, type=int)
 
     parser.add_argument('--ne', default=100, type=int)
@@ -273,13 +305,14 @@ if __name__ == "__main__":
     parser.add_argument('--fck', default=1, type=int)
     parser.add_argument('--fdim', default=8, type=int, required=True)
     parser.add_argument('--ich', default=1, type=int, required=True)
-    parser.add_argument('--dec_type', default='DECONV')
-
+    parser.add_argument('--dec_type', default='FC')
+    parser.add_argument('--drp', default=0, type=float)
     parser.add_argument('--res_folder', default='output', required=True)
-    parser.add_argument('--aug', default=1, type=int)
+    parser.add_argument('--aug', default=1, type=int, required=True)
     parser.add_argument('--nc_recon', default=3, type=int, required=True)
     parser.add_argument('--hard', default=0, type=int, required=True)
     parser.add_argument('--checkpoint', default='')
+    parser.add_argument('--test_only', default=0, type=int)
 
 
     args = parser.parse_args()
@@ -288,7 +321,7 @@ if __name__ == "__main__":
     if not (os.path.exists(resultsFolder)):
         os.mkdir(resultsFolder)
 
-    outputFolder = f'CFC-{args.dec_type}-{args.dset}-{args.fck}-{args.fdim}'
+    outputFolder = f'CFC-{args.dec_type}-{args.dset}-{args.fck}-{args.fdim}-{args.drp}'
     if args.hard == 1:
         outputFolder += '-H'
 
@@ -309,10 +342,42 @@ if __name__ == "__main__":
         os.makedirs(outputFolder)
 
 
+    def processor(sample):
+
+        data, labels, training = sample
+
+        if (len(data.size()) == 3):
+            data = data.unsqueeze(1)
+
+        data = data.float() / 255.0
+        if args.aug == 1:
+            data = augmentation(data)
+
+        if args.dset == 'aff_expanded':
+            labels = labels.reshape(labels.size(0))
+
+        labels = torch.LongTensor(labels)
+
+        labels = torch.eye(args.nc).index_select(dim=0, index=labels)
+
+        data = Variable(data).cuda()
+        labels = Variable(labels).cuda()
+
+
+        if training:
+            classes, reconstructions = model(data, labels)
+        else:
+            classes, reconstructions = model(data)
+
+        loss = capsule_loss(data, labels, classes, reconstructions)
+
+        return loss, classes
+
    
     model = CapsuleNet(args.nc, args.niter, width=args.w, in_channels=args.ich, fc_kernel_size=args.fck,
-                       fc_out_dim=args.fdim, nc_recon=args.nc_recon, decoder_type=args.dec_type)
-    if args.hard == 1:
+                       fc_out_dim=args.fdim, nc_recon=args.nc_recon, decoder_type=args.dec_type, drp=args.drp)
+    if args.hard == 1 or args.checkpoint != "":
+        print(f'Loading Checkpoint: {args.checkpoint}')
         model.load_state_dict(torch.load(args.checkpoint))
 
     # model.load_state_dict(torch.load('epochs/epoch_327.pt'))
@@ -328,17 +393,17 @@ if __name__ == "__main__":
     my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer, gamma=decayRate)
 
     engine = Engine()
+
+
     meter_loss = tnt.meter.AverageValueMeter()
     meter_accuracy = tnt.meter.ClassErrorMeter(accuracy=True)
-    confusion_meter = tnt.meter.ConfusionMeter(args.nc, normalized=True)
+
 
     train_loss_logger = VisdomPlotLogger('line', opts={'title': 'Train Loss'})
     train_error_logger = VisdomPlotLogger('line', opts={'title': 'Train Accuracy'})
     test_loss_logger = VisdomPlotLogger('line', opts={'title': 'Test Loss'})
     test_accuracy_logger = VisdomPlotLogger('line', opts={'title': 'Test Accuracy'})
-    confusion_logger = VisdomLogger('heatmap', opts={'title': 'Confusion matrix',
-                                                     'columnnames': list(range(args.nc)),
-                                                     'rownames': list(range(args.nc))})
+
     ground_truth_logger = VisdomLogger('image', opts={'title': 'Ground Truth'})
     reconstruction_logger = VisdomLogger('image', opts={'title': 'Reconstruction'})
 
@@ -359,36 +424,13 @@ if __name__ == "__main__":
     final_acc = 0
 
 
-    def processor(sample):
-        data, labels, training = sample
 
-        if (len(data.size()) == 3):
-            data = data.unsqueeze(1)
-
-        data = data.float() / 255.0
-        if args.aug == 1:
-            data = augmentation(data)
-        labels = torch.LongTensor(labels)
-
-        labels = torch.eye(args.nc).index_select(dim=0, index=labels)
-
-        data = Variable(data).cuda()
-        labels = Variable(labels).cuda()
-
-        if training:
-            classes, reconstructions = model(data, labels)
-        else:
-            classes, reconstructions = model(data)
-
-        loss = capsule_loss(data, labels, classes, reconstructions)
-
-        return loss, classes
 
 
     def reset_meters():
         meter_accuracy.reset()
         meter_loss.reset()
-        confusion_meter.reset()
+
 
 
     def on_sample(state):
@@ -397,7 +439,6 @@ if __name__ == "__main__":
 
     def on_forward(state):
         meter_accuracy.add(state['output'].data, torch.LongTensor(state['sample'][1]))
-        confusion_meter.add(state['output'].data, torch.LongTensor(state['sample'][1]))
         meter_loss.add(state['loss'].item())
 
 
@@ -427,7 +468,7 @@ if __name__ == "__main__":
         test_loss_logger.log(state['epoch'], meter_loss.value()[0])
         test_accuracy.append(meter_accuracy.value()[0])
         test_accuracy_logger.log(state['epoch'], meter_accuracy.value()[0])
-        confusion_logger.log(confusion_meter.value())
+
 
         my_lr_scheduler.step()
 
@@ -440,7 +481,8 @@ if __name__ == "__main__":
         if int(state['epoch']) == args.ne:
             torch.save(model.state_dict(), f'{outputFolder}/checkpoint.pt')
 
-        # torch.save(model.state_dict(), 'epochs/epoch_%d.pt' % state['epoch'])
+        
+        # torch.save(model.state_dict(), f'{args.res_folder}/epoch_%d.pt' % state['epoch'])
 
         # Reconstruction visualization.
 
@@ -469,6 +511,12 @@ if __name__ == "__main__":
     engine.hooks['on_start_epoch'] = on_start_epoch
     engine.hooks['on_end_epoch'] = on_end_epoch
 
+    if args.test_only == 1:
+        state = engine.test(processor, get_iterator(args.dset, args.bsize, False))
+        print(f"Test Accuracy: {meter_accuracy.value()[0]}")
+        quit()
+
+
     engine.train(processor,  get_iterator(args.dset, args.bsize, True), maxepoch=args.ne, optimizer=optimizer)
 
     with open(f'{outputFolder}/res', 'w') as file:
@@ -482,6 +530,6 @@ if __name__ == "__main__":
     if args.checkpoint == '':
         import os
 
-        hard_cmd = f'python main.py --dset {args.dset} --w {args.w} --nc {args.nc} --ich {args.ich} --fck {args.fck} --fdim {args.fdim} --dec_type {args.dec_type} --res_folder {args.res_folder} --aug {args.aug} --nc_recon {args.nc_recon} --hard 1 --checkpoint {outputFolder}/checkpoint.pt'
+        hard_cmd = f'python main.py --dset {args.dset} --w {args.w} --nc {args.nc} --ich {args.ich} --fck {args.fck} --fdim {args.fdim} --dec_type {args.dec_type} --res_folder {args.res_folder} --drp {args.drp} --aug {args.aug} --nc_recon {args.nc_recon} --hard 1 --checkpoint {outputFolder}/checkpoint.pt'
         with open('hardrun', 'w') as file:
             file.write(f'{hard_cmd}')
